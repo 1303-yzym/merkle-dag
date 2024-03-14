@@ -1,102 +1,197 @@
 package merkledag
 
 import (
-	"errors"
+	"encoding/json"
 	"hash"
 )
 
-// 两个栈：A用于遍历树，B用于存储悬而未决的DIR节点
-// 判断节点类型，若为FILE节点，则将其hash值写入KVStore，放回其hash
-// 若为DIR节点，将此节点放入B，遍历其子节点
-// 若其子节点为FILE则直接存入KVStore，若为DIR则放入A，B
-// 弹出A最上层元素，用同样的方法处理，直到A为空
-// 弹出B最上层元素，计算其哈希，直到B为空
-// 当B为空时，返回根节点的哈希值
-func add(store KVStore, node Node, h hash.Hash) []byte {
-	A := New()
-	B := New()
-	if node.Type() == FILE {
-		store.Put(h.Sum(node.Bytes()), node.Bytes())
-		return h.Sum(node.Bytes())
+type Link struct {
+	Name string
+	Hash []byte
+	Size int
+}
+
+type Object struct {
+	Links []Link
+	Data  []byte
+}
+
+func dfsForSliceFile(hight int, node File, store KVStore, seedId int, h hash.Hash) (*Object, int) {
+	if hight == 1 {
+		if (len(node.Bytes()) - seedId) <= 256*1024 {
+			data := node.Bytes()[seedId:]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			jsonMarshal, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonMarshal)
+			flag, _ := store.Has(h.Sum(nil))
+			if !flag {
+				store.Put(h.Sum(nil), data)
+			}
+			return &blob, len(data)
+		}
+		links := &Object{}
+		lenData := 0
+		for i := 1; i <= 4096; i++ {
+			end := seedId + 256*1024
+			if len(node.Bytes()) < end {
+				end = len(node.Bytes())
+			}
+			data := node.Bytes()[seedId:end]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			lenData += len(data)
+			jsonMarshal, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonMarshal)
+			flag, _ := store.Has(h.Sum(nil))
+			if !flag {
+				store.Put(h.Sum(nil), data)
+			}
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: len(data),
+			})
+			links.Data = append(links.Data, []byte("blob")...)
+			seedId += 256 * 1024
+			if seedId >= len(node.Bytes()) {
+				break
+			}
+		}
+		jsonMarshal, _ := json.Marshal(links)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), jsonMarshal)
+		}
+		return links, lenData
 	} else {
-		traverse(node, store, h, A, B)
-		for !A.Empty() {
-			temp, _ := A.Pop()
-			traverse(temp.(Node), store, h, A, B)
-		}
-		for !B.Empty() {
-			temp, _ := B.Pop()
-			it = temp.(Node).It()
-			result := make([]byte, 0)
-			for it.Next() {
-				aahash := h.Sum(it.Node().Bytes())
-				result = append(result, aahash...)
+		links := &Object{}
+		lenData := 0
+		for i := 1; i <= 4096; i++ {
+			if seedId >= len(node.Bytes()) {
+				break
 			}
-			store.Put(h.Sum(result), temp.(Node).Bytes())
-			if B.Empty() {
-				return h.Sum(result)
-
+			tmp, lens := dfsForSliceFile(hight-1, node, store, seedId, h)
+			lenData += lens
+			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: lens,
+			})
+			typeName := "link"
+			if tmp.Links == nil {
+				typeName = "blob"
 			}
+			links.Data = append(links.Data, []byte(typeName)...)
 		}
-
+		jsonMarshal, _ := json.Marshal(links)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), jsonMarshal)
+		}
+		return links, lenData
 	}
-	return nil
 }
-func traverse(node Node, store KVStore, h hash.Hash, A *ArrayStack, B *ArrayStack) {
-	it = node.It()
-	for it.Next() {
-		if it.Node().Type() == FILE {
-			store.Put(h.Sum(it.Node().Bytes()), it.Node().Bytes())
+func sliceFile(node File, store KVStore, h hash.Hash) *Object {
+	// fmt.Println("222222")
+	if len(node.Bytes()) <= 256*1024 { //小于256k，无需分片
+		data := node.Bytes()
+		blob := Object{
+			Links: nil,
+			Data:  data,
+		}
+		jsonMarshal, _ := json.Marshal(blob)
+		h.Reset()
+		h.Write(jsonMarshal)
+		flag, _ := store.Has(h.Sum(nil))
+		if !flag {
+			store.Put(h.Sum(nil), data)
+		}
+		return &blob
+	}
+	linkLen := (len(node.Bytes()) + (256*1024 - 1)) / (256 * 1024)
+	hight := 0
+	tmp := linkLen
+	for {
+		hight++
+		tmp /= 4096
+		if tmp == 0 {
+			break
+		}
+	}
+	res, _ := dfsForSliceFile(hight, node, store, 0, h)
+	return res
+}
+
+func sliceDir(node Dir, store KVStore, h hash.Hash) *Object {
+	iter := node.It()
+	treeObject := &Object{}
+	for iter.Next() {
+		node := iter.Node()
+		if node.Type() == FILE {
+			file := node.(File)
+			tmp := sliceFile(file, store, h)
+			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
+			treeObject.Links = append(treeObject.Links, Link{
+				Hash: h.Sum(nil),
+				Size: int(file.Size()),
+				Name: file.Name(),
+			})
+			typeName := "link"
+			if tmp.Links == nil {
+				typeName = "blob"
+			}
+			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
 		} else {
-			A.Push(it.Node())
-			B.Push(it.Node())
+			dir := node.(Dir)
+			tmp := sliceDir(dir, store, h)
+			jsonMarshal, _ := json.Marshal(tmp)
+			h.Reset()
+			h.Write(jsonMarshal)
+			treeObject.Links = append(treeObject.Links, Link{
+				Hash: h.Sum(nil),
+				Size: int(dir.Size()),
+				Name: dir.Name(),
+			})
+			typeName := "tree"
+			treeObject.Data = append(treeObject.Data, []byte(typeName)...)
 		}
 	}
-}
-
-type ArrayStack struct {
-	elements []interface{}
-}
-
-// New creates a new array stack.
-func New() *ArrayStack {
-	return &ArrayStack{}
-}
-
-// Size returns the number of elements in the stack.
-func (s *ArrayStack) Size() int {
-	return len(s.elements)
-}
-
-// Empty returns true or false whether the stack has zero elements or not.
-func (s *ArrayStack) Empty() bool {
-	return len(s.elements) == 0
-}
-
-// Clear clears the stack.
-func (s *ArrayStack) Clear() {
-	s.elements = make([]interface{}, 0, 10)
-}
-
-// Push adds an element to the stack.
-func (s *ArrayStack) Push(e interface{}) {
-	s.elements = append(s.elements, e)
-}
-
-// Pop fetches the top element of the stack and removes it.
-func (s *ArrayStack) Pop() (interface{}, error) {
-	if s.Empty() {
-		return nil, errors.New("Pop: the stack cannot be empty")
+	jsonMarshal, _ := json.Marshal(treeObject)
+	h.Reset()
+	h.Write(jsonMarshal)
+	flag, _ := store.Has(h.Sum(nil))
+	if !flag {
+		store.Put(h.Sum(nil), jsonMarshal)
 	}
-	result := s.elements[len(s.elements)-1]
-	s.elements = s.elements[:len(s.elements)-1]
-	return result, nil
+	return treeObject
 }
-
-// Top returns the top of element from the stack, but does not remove it.
-func (s *ArrayStack) Top() (interface{}, error) {
-	if s.Empty() {
-		return nil, errors.New("Top: stack cannot be empty")
+func Add(store KVStore, node Node, h hash.Hash) []byte {
+	// TODO 将分片写入到KVStore中，并返回Merkle Root
+	if node.Type() == FILE {
+		file := node.(File)
+		tmp := sliceFile(file, store, h)
+		jsonMarshal, _ := json.Marshal(tmp)
+		h.Write(jsonMarshal)
+		return h.Sum(nil)
+	} else {
+		dir := node.(Dir)
+		tmp := sliceDir(dir, store, h)
+		jsonMarshal, _ := json.Marshal(tmp)
+		h.Write(jsonMarshal)
+		return h.Sum(nil)
 	}
-	return s.elements[len(s.elements)-1], nil
 }
